@@ -1,0 +1,67 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore src/ClipTranslateOnce/ClipTranslateOnce.csproj
+
+      - name: Build
+        run: dotnet build src/ClipTranslateOnce/ClipTranslateOnce.csproj -c Release --no-restore
+
+      - name: Publish framework-dependent
+        shell: pwsh
+        run: |
+          dotnet publish src/ClipTranslateOnce/ClipTranslateOnce.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained false `
+            /p:PublishSingleFile=true `
+            /p:DebugType=None `
+            /p:DebugSymbols=false `
+            -o artifacts/ClipTranslateOnce-win-x64-framework-dependent
+
+      - name: Publish self-contained
+        shell: pwsh
+        run: |
+          dotnet publish src/ClipTranslateOnce/ClipTranslateOnce.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            /p:PublishSingleFile=true `
+            /p:DebugType=None `
+            /p:DebugSymbols=false `
+            -o artifacts/ClipTranslateOnce-win-x64-self-contained
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path artifacts/ClipTranslateOnce-win-x64-framework-dependent/* -DestinationPath dist/ClipTranslateOnce-win-x64-framework-dependent.zip -Force
+          Compress-Archive -Path artifacts/ClipTranslateOnce-win-x64-self-contained/* -DestinationPath dist/ClipTranslateOnce-win-x64-self-contained.zip -Force
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ClipTranslateOnce-windows-builds
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30

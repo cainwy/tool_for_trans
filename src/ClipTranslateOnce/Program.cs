@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Drawing;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -29,7 +30,7 @@ internal static class Program
 
             if (cli.ShowVersion)
             {
-                Console.WriteLine("ClipTranslateOnce 0.2.0");
+                Console.WriteLine("ClipTranslateOnce 0.3.0");
                 return 0;
             }
 
@@ -281,7 +282,7 @@ ClipTranslateOnce - 单次调用的低资源浮层翻译工具
   --auto                  先尝试 selected，失败后读取 clipboard。
 
 翻译选项：
-  --provider <name>       deepl | libretranslate | echo
+  --provider <name>       mymemory | microsoft | baidu | libretranslate | deepl | echo
   --target <lang>         目标语言，例如 ZH-HANS、EN-US、JA、zh、en。
   --source <lang>         源语言。留空时由翻译后端自动检测。
   --max-chars <n>         最大输入字符数。
@@ -350,17 +351,40 @@ internal sealed record InputConfig
 
 internal sealed record TranslationConfig
 {
-    // deepl | libretranslate | echo
-    public string Provider { get; set; } = "deepl";
+    // mymemory | microsoft | baidu | libretranslate | deepl | echo
+    public string Provider { get; set; } = "mymemory";
     public string TargetLang { get; set; } = "ZH-HANS";
     public string AlternateTargetLangWhenInputLooksChinese { get; set; } = "EN-US";
     public string SourceLang { get; set; } = "";
+    public int TimeoutMs { get; set; } = 8000;
+
+    // MyMemory：可无密钥使用；sourceLang 为空时会按文本粗略判断源语言。
+    public string MyMemoryEndpoint { get; set; } = "https://api.mymemory.translated.net/get";
+    public string MyMemoryEmail { get; set; } = "";
+    public string MyMemoryKey { get; set; } = "";
+
+    // Microsoft Translator / Azure AI Translator。
+    public string MicrosoftEndpoint { get; set; } = "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0";
+    public string MicrosoftApiKeyEnv { get; set; } = "AZURE_TRANSLATOR_KEY";
+    public string MicrosoftApiKey { get; set; } = "";
+    public string MicrosoftRegionEnv { get; set; } = "AZURE_TRANSLATOR_REGION";
+    public string MicrosoftRegion { get; set; } = "";
+
+    // 百度翻译开放平台。
+    public string BaiduEndpoint { get; set; } = "https://fanyi-api.baidu.com/api/trans/vip/translate";
+    public string BaiduAppIdEnv { get; set; } = "BAIDU_TRANSLATE_APPID";
+    public string BaiduAppId { get; set; } = "";
+    public string BaiduKeyEnv { get; set; } = "BAIDU_TRANSLATE_KEY";
+    public string BaiduKey { get; set; } = "";
+
+    // DeepL：保留兼容。
     public string ApiKeyEnv { get; set; } = "DEEPL_API_KEY";
     public string ApiKey { get; set; } = "";
     public string Endpoint { get; set; } = "https://api-free.deepl.com/v2/translate";
-    public int TimeoutMs { get; set; } = 8000;
     public string DeeplModelType { get; set; } = "latency_optimized";
     public string DeeplSplitSentences { get; set; } = "nonewlines";
+
+    // LibreTranslate：自建实例通常不需要 key，公网实例可能需要 key。
     public string LibreTranslateEndpoint { get; set; } = "http://127.0.0.1:5000/translate";
     public string LibreTranslateApiKey { get; set; } = "";
 }
@@ -535,20 +559,139 @@ internal static class Translator
 {
     public static Task<string> TranslateAsync(string text, TranslationConfig cfg)
     {
-        var provider = (cfg.Provider ?? "deepl").Trim().ToLowerInvariant();
+        var provider = (cfg.Provider ?? "mymemory").Trim().ToLowerInvariant();
         return provider switch
         {
             "echo" => Task.FromResult(text),
+            "mymemory" => TranslateWithMyMemoryAsync(text, cfg),
+            "microsoft" or "azure" or "azuretranslator" => TranslateWithMicrosoftAsync(text, cfg),
+            "baidu" => TranslateWithBaiduAsync(text, cfg),
             "libretranslate" => TranslateWithLibreAsync(text, cfg),
-            _ => TranslateWithDeepLAsync(text, cfg)
+            "deepl" => TranslateWithDeepLAsync(text, cfg),
+            _ => throw new InvalidOperationException($"未知翻译后端：{cfg.Provider}。可用值：mymemory、microsoft、baidu、libretranslate、deepl、echo。")
         };
+    }
+
+    private static async Task<string> TranslateWithMyMemoryAsync(string text, TranslationConfig cfg)
+    {
+        var target = NormalizeMyMemoryLang(PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese));
+        var source = string.IsNullOrWhiteSpace(cfg.SourceLang)
+            ? (LooksChinese(text) ? "zh-CN" : "en")
+            : NormalizeMyMemoryLang(cfg.SourceLang);
+
+        if (source.Equals(target, StringComparison.OrdinalIgnoreCase))
+            target = target.StartsWith("zh", StringComparison.OrdinalIgnoreCase) ? "en" : "zh-CN";
+
+        var query = new Dictionary<string, string>
+        {
+            ["q"] = text,
+            ["langpair"] = $"{source}|{target}",
+            ["mt"] = "1"
+        };
+        if (!string.IsNullOrWhiteSpace(cfg.MyMemoryEmail)) query["de"] = cfg.MyMemoryEmail.Trim();
+        if (!string.IsNullOrWhiteSpace(cfg.MyMemoryKey)) query["key"] = cfg.MyMemoryKey.Trim();
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(Math.Max(1000, cfg.TimeoutMs)) };
+        using var resp = await http.GetAsync(AppendQuery(cfg.MyMemoryEndpoint, query)).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"MyMemory HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+
+        if (root.TryGetProperty("responseStatus", out var status) && status.ValueKind == JsonValueKind.Number && status.GetInt32() >= 400)
+        {
+            var details = root.TryGetProperty("responseDetails", out var d) ? d.GetString() : body;
+            throw new InvalidOperationException("MyMemory: " + TrimError(details ?? body));
+        }
+
+        var translated = root.GetProperty("responseData").GetProperty("translatedText").GetString() ?? "";
+        translated = System.Net.WebUtility.HtmlDecode(translated).Trim();
+        if (string.IsNullOrWhiteSpace(translated))
+            throw new InvalidOperationException("MyMemory 返回空译文。若源语言自动判断不准，请显式指定 --source en / --source zh-CN / --source ja。 ");
+        return translated;
+    }
+
+    private static async Task<string> TranslateWithMicrosoftAsync(string text, TranslationConfig cfg)
+    {
+        var apiKey = ReadSecret(cfg.MicrosoftApiKey, cfg.MicrosoftApiKeyEnv);
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new InvalidOperationException($"没有配置 Microsoft Translator key。请设置环境变量 {cfg.MicrosoftApiKeyEnv}，或在 appsettings.json 的 translation.microsoftApiKey 中填写。调试时可把 provider 改为 mymemory 或 echo。 ");
+
+        var target = NormalizeMicrosoftLang(PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese));
+        var query = new Dictionary<string, string> { ["to"] = target };
+        if (!string.IsNullOrWhiteSpace(cfg.SourceLang)) query["from"] = NormalizeMicrosoftLang(cfg.SourceLang);
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(Math.Max(1000, cfg.TimeoutMs)) };
+        using var req = new HttpRequestMessage(HttpMethod.Post, AppendQuery(cfg.MicrosoftEndpoint, query));
+        req.Headers.Add("Ocp-Apim-Subscription-Key", apiKey);
+
+        var region = ReadSecret(cfg.MicrosoftRegion, cfg.MicrosoftRegionEnv);
+        if (!string.IsNullOrWhiteSpace(region)) req.Headers.Add("Ocp-Apim-Subscription-Region", region.Trim());
+        req.Headers.Add("X-ClientTraceId", Guid.NewGuid().ToString());
+        req.Content = new StringContent(JsonSerializer.Serialize(new[] { new { Text = text } }), Encoding.UTF8, "application/json");
+
+        using var resp = await http.SendAsync(req).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Microsoft Translator HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement[0].GetProperty("translations")[0].GetProperty("text").GetString() ?? "";
+    }
+
+    private static async Task<string> TranslateWithBaiduAsync(string text, TranslationConfig cfg)
+    {
+        var appId = ReadSecret(cfg.BaiduAppId, cfg.BaiduAppIdEnv);
+        var key = ReadSecret(cfg.BaiduKey, cfg.BaiduKeyEnv);
+        if (string.IsNullOrWhiteSpace(appId) || string.IsNullOrWhiteSpace(key))
+            throw new InvalidOperationException($"没有配置百度翻译 APPID/Key。请设置环境变量 {cfg.BaiduAppIdEnv} 和 {cfg.BaiduKeyEnv}，或在 appsettings.json 中填写 translation.baiduAppId / translation.baiduKey。调试时可把 provider 改为 mymemory 或 echo。 ");
+
+        var source = string.IsNullOrWhiteSpace(cfg.SourceLang) ? "auto" : NormalizeBaiduLang(cfg.SourceLang);
+        var target = NormalizeBaiduLang(PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese));
+        var salt = Random.Shared.Next(100000, 999999999).ToString();
+        var sign = Md5Hex(appId.Trim() + text + salt + key.Trim());
+
+        var form = new Dictionary<string, string>
+        {
+            ["q"] = text,
+            ["from"] = source,
+            ["to"] = target,
+            ["appid"] = appId.Trim(),
+            ["salt"] = salt,
+            ["sign"] = sign
+        };
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(Math.Max(1000, cfg.TimeoutMs)) };
+        using var content = new FormUrlEncodedContent(form);
+        using var resp = await http.PostAsync(cfg.BaiduEndpoint, content).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Baidu HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        if (root.TryGetProperty("error_code", out var errorCode))
+        {
+            var msg = root.TryGetProperty("error_msg", out var errorMsg) ? errorMsg.GetString() : body;
+            throw new InvalidOperationException($"Baidu {errorCode.GetString()}: {TrimError(msg ?? body)}");
+        }
+
+        if (!root.TryGetProperty("trans_result", out var result) || result.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException("Baidu 返回中没有 trans_result：" + TrimError(body));
+
+        return string.Join(Environment.NewLine,
+            result.EnumerateArray()
+                  .Select(x => x.TryGetProperty("dst", out var dst) ? dst.GetString() : "")
+                  .Where(x => !string.IsNullOrWhiteSpace(x)));
     }
 
     private static async Task<string> TranslateWithDeepLAsync(string text, TranslationConfig cfg)
     {
-        var apiKey = GetApiKey(cfg);
+        var apiKey = ReadSecret(cfg.ApiKey, cfg.ApiKeyEnv);
         if (string.IsNullOrWhiteSpace(apiKey))
-            throw new InvalidOperationException($"没有配置 DeepL API key。请设置环境变量 {cfg.ApiKeyEnv}，或在 appsettings.json 的 translation.apiKey 中填写。调试时可把 provider 改为 echo。");
+            throw new InvalidOperationException($"没有配置 DeepL API key。请设置环境变量 {cfg.ApiKeyEnv}，或在 appsettings.json 的 translation.apiKey 中填写。调试时可把 provider 改为 mymemory 或 echo。 ");
 
         var target = PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese);
 
@@ -599,10 +742,10 @@ internal static class Translator
         return doc.RootElement.GetProperty("translatedText").GetString() ?? "";
     }
 
-    private static string GetApiKey(TranslationConfig cfg)
+    private static string ReadSecret(string directValue, string envName)
     {
-        if (!string.IsNullOrWhiteSpace(cfg.ApiKey)) return cfg.ApiKey.Trim();
-        return string.IsNullOrWhiteSpace(cfg.ApiKeyEnv) ? "" : (Environment.GetEnvironmentVariable(cfg.ApiKeyEnv.Trim()) ?? "");
+        if (!string.IsNullOrWhiteSpace(directValue)) return directValue.Trim();
+        return string.IsNullOrWhiteSpace(envName) ? "" : (Environment.GetEnvironmentVariable(envName.Trim()) ?? "").Trim();
     }
 
     private static string PickTargetLanguage(string text, string target, string alternateWhenChinese)
@@ -613,6 +756,45 @@ internal static class Translator
         return target;
     }
 
+    private static string NormalizeMicrosoftLang(string lang)
+    {
+        lang = lang.Trim().ToLowerInvariant();
+        return lang switch
+        {
+            "zh" or "zh-cn" or "zh-hans" => "zh-Hans",
+            "zh-tw" or "zh-hant" => "zh-Hant",
+            "en-us" or "en-gb" => "en",
+            "jp" => "ja",
+            _ => lang
+        };
+    }
+
+    private static string NormalizeBaiduLang(string lang)
+    {
+        lang = lang.Trim().ToLowerInvariant();
+        return lang switch
+        {
+            "zh" or "zh-cn" or "zh-hans" => "zh",
+            "zh-tw" or "zh-hant" or "cht" => "cht",
+            "en-us" or "en-gb" => "en",
+            "ja" => "jp",
+            _ => lang
+        };
+    }
+
+    private static string NormalizeMyMemoryLang(string lang)
+    {
+        lang = lang.Trim().ToLowerInvariant();
+        return lang switch
+        {
+            "zh" or "zh-cn" or "zh-hans" => "zh-CN",
+            "zh-tw" or "zh-hant" or "cht" => "zh-TW",
+            "en-us" or "en-gb" => "en",
+            "jp" => "ja",
+            _ => lang
+        };
+    }
+
     private static string NormalizeLibreLang(string lang)
     {
         lang = lang.Trim().ToLowerInvariant();
@@ -620,6 +802,7 @@ internal static class Translator
         {
             "zh-hans" or "zh-hant" or "zh-cn" or "zh-tw" => "zh",
             "en-us" or "en-gb" => "en",
+            "jp" => "ja",
             _ => lang
         };
     }
@@ -633,6 +816,20 @@ internal static class Translator
             if (char.IsLetter(ch)) letters++;
         }
         return letters > 0 && cjk >= Math.Max(2, letters / 4);
+    }
+
+    private static string AppendQuery(string endpoint, IReadOnlyDictionary<string, string> values)
+    {
+        var sb = new StringBuilder(endpoint);
+        sb.Append(endpoint.Contains('?') ? '&' : '?');
+        sb.Append(string.Join("&", values.Select(kv => $"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value)}")));
+        return sb.ToString();
+    }
+
+    private static string Md5Hex(string input)
+    {
+        var bytes = MD5.HashData(Encoding.UTF8.GetBytes(input));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
     private static string TrimError(string s) => string.IsNullOrWhiteSpace(s) ? "" : s.Length <= 600 ? s : s[..600] + "...";

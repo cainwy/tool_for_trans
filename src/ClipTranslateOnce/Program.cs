@@ -30,7 +30,7 @@ internal static class Program
 
             if (cli.ShowVersion)
             {
-                Console.WriteLine("ClipTranslateOnce 0.3.0");
+                Console.WriteLine("ClipTranslateOnce 0.4.0");
                 return 0;
             }
 
@@ -282,7 +282,7 @@ ClipTranslateOnce - 单次调用的低资源浮层翻译工具
   --auto                  先尝试 selected，失败后读取 clipboard。
 
 翻译选项：
-  --provider <name>       mymemory | microsoft | baidu | libretranslate | deepl | echo
+  --provider <name>       keyless | mymemory | youdao-mobile | sogou-page | bing-web | baidu-web | iciba-web | microsoft | baidu | libretranslate | deepl | echo
   --target <lang>         目标语言，例如 ZH-HANS、EN-US、JA、zh、en。
   --source <lang>         源语言。留空时由翻译后端自动检测。
   --max-chars <n>         最大输入字符数。
@@ -351,12 +351,22 @@ internal sealed record InputConfig
 
 internal sealed record TranslationConfig
 {
-    // mymemory | microsoft | baidu | libretranslate | deepl | echo
-    public string Provider { get; set; } = "mymemory";
+    // keyless | mymemory | youdao-mobile | sogou-page | bing-web | baidu-web | iciba-web | microsoft | baidu | libretranslate | deepl | echo
+    public string Provider { get; set; } = "keyless";
     public string TargetLang { get; set; } = "ZH-HANS";
     public string AlternateTargetLangWhenInputLooksChinese { get; set; } = "EN-US";
     public string SourceLang { get; set; } = "";
     public int TimeoutMs { get; set; } = 8000;
+
+    // 无需手动申请密钥的实验性后端。它们主要来自公共网页接口或页面解析，稳定性弱于正式 API。
+    public string KeylessFallbackProviders { get; set; } = "mymemory,youdao-mobile,bing-web,sogou-page,iciba-web";
+    public string WebUserAgent { get; set; } = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
+    public string YoudaoMobileEndpoint { get; set; } = "http://m.youdao.com/translate";
+    public string SogouPageEndpoint { get; set; } = "https://fanyi.sogou.com/text";
+    public string BingWebBaseUrl { get; set; } = "https://cn.bing.com";
+    public string BaiduWebBaseUrl { get; set; } = "https://fanyi.baidu.com";
+    public string IcibaWebEndpointPrefix { get; set; } = "https://ifanyi.iciba.com/index.php?c=trans&m=fy&client=6&auth_user=key_web_fanyi&sign=";
+    public string IcibaWebSecretPrefix { get; set; } = "6key_web_fanyiifanyiweb8hc9s98e";
 
     // MyMemory：可无密钥使用；sourceLang 为空时会按文本粗略判断源语言。
     public string MyMemoryEndpoint { get; set; } = "https://api.mymemory.translated.net/get";
@@ -563,13 +573,226 @@ internal static class Translator
         return provider switch
         {
             "echo" => Task.FromResult(text),
+            "keyless" or "auto-keyless" or "webauto" => TranslateWithKeylessAutoAsync(text, cfg),
             "mymemory" => TranslateWithMyMemoryAsync(text, cfg),
+            "youdao" or "youdao-mobile" => TranslateWithYoudaoMobileAsync(text, cfg),
+            "sogou" or "sogou-page" => TranslateWithSogouPageAsync(text, cfg),
+            "bing-web" => TranslateWithBingWebAsync(text, cfg),
+            "baidu-web" => TranslateWithBaiduWebAsync(text, cfg),
+            "iciba" or "iciba-web" => TranslateWithIcibaWebAsync(text, cfg),
             "microsoft" or "azure" or "azuretranslator" => TranslateWithMicrosoftAsync(text, cfg),
-            "baidu" => TranslateWithBaiduAsync(text, cfg),
+            "baidu" or "baidu-api" => TranslateWithBaiduAsync(text, cfg),
             "libretranslate" => TranslateWithLibreAsync(text, cfg),
             "deepl" => TranslateWithDeepLAsync(text, cfg),
-            _ => throw new InvalidOperationException($"未知翻译后端：{cfg.Provider}。可用值：mymemory、microsoft、baidu、libretranslate、deepl、echo。")
+            _ => throw new InvalidOperationException($"未知翻译后端：{cfg.Provider}。可用值：keyless、mymemory、youdao-mobile、sogou-page、bing-web、baidu-web、iciba-web、microsoft、baidu、libretranslate、deepl、echo。")
         };
+    }
+
+    private static async Task<string> TranslateWithKeylessAutoAsync(string text, TranslationConfig cfg)
+    {
+        var providers = (cfg.KeylessFallbackProviders ?? "mymemory,youdao-mobile,bing-web,sogou-page,iciba-web")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(p => !p.Equals("keyless", StringComparison.OrdinalIgnoreCase)
+                     && !p.Equals("auto-keyless", StringComparison.OrdinalIgnoreCase)
+                     && !p.Equals("webauto", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (providers.Length == 0)
+            throw new InvalidOperationException("keyless 没有可用的 fallback provider。请配置 translation.keylessFallbackProviders。 ");
+
+        var errors = new List<string>();
+        foreach (var p in providers)
+        {
+            try
+            {
+                var result = await TranslateAsync(text, cfg with { Provider = p }).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(result)) return result;
+                errors.Add($"{p}: 返回空译文");
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"{p}: {ex.Message}");
+            }
+        }
+
+        throw new InvalidOperationException("keyless fallback 全部失败：" + string.Join(" | ", errors.Select(TrimError)));
+    }
+
+    private static async Task<string> TranslateWithYoudaoMobileAsync(string text, TranslationConfig cfg)
+    {
+        if (text.Length > 1000)
+            throw new InvalidOperationException("youdao-mobile 通常只适合 1000 字符以内文本。长文本请改用 mymemory、bing-web、sogou-page 或正式 API。 ");
+
+        using var http = CreateBrowserHttpClient(cfg);
+        using var req = new HttpRequestMessage(HttpMethod.Post, cfg.YoudaoMobileEndpoint);
+        req.Headers.Referrer = new Uri("http://m.youdao.com/");
+        req.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["type"] = "AUTO",
+            ["inputtext"] = text
+        });
+
+        using var resp = await http.SendAsync(req).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Youdao mobile HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        var m = Regex.Match(body, @"id\s*=\s*['""']translateResult['""'][\s\S]*?<li[^>]*>([\s\S]*?)</li>", RegexOptions.IgnoreCase);
+        if (!m.Success)
+            m = Regex.Match(body, @"<li[^>]*>([\s\S]*?)</li>", RegexOptions.IgnoreCase);
+
+        var translated = m.Success ? HtmlToText(m.Groups[1].Value) : "";
+        if (string.IsNullOrWhiteSpace(translated))
+            throw new InvalidOperationException("Youdao mobile 返回空译文或页面结构已变化。 ");
+        return translated;
+    }
+
+    private static async Task<string> TranslateWithSogouPageAsync(string text, TranslationConfig cfg)
+    {
+        var target = NormalizeSogouWebLang(PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese));
+        var endpoint = cfg.SogouPageEndpoint;
+        var query = new Dictionary<string, string>
+        {
+            ["keyword"] = text,
+            ["transto"] = target
+        };
+
+        using var http = CreateBrowserHttpClient(cfg);
+        using var resp = await http.GetAsync(AppendQuery(endpoint, query)).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Sogou page HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        var m = Regex.Match(body, @"id\s*=\s*['""']trans-result['""'][^>]*>([\s\S]*?)</", RegexOptions.IgnoreCase);
+        var translated = m.Success ? HtmlToText(m.Groups[1].Value) : "";
+        if (string.IsNullOrWhiteSpace(translated))
+            throw new InvalidOperationException("Sogou page 返回空译文或页面结构已变化。 ");
+        return translated;
+    }
+
+    private static async Task<string> TranslateWithBingWebAsync(string text, TranslationConfig cfg)
+    {
+        if (text.Length > 2500)
+            throw new InvalidOperationException("bing-web 通常只适合 2500 字符以内文本。长文本请分段或改用正式 API。 ");
+
+        var baseUrl = cfg.BingWebBaseUrl.TrimEnd('/');
+        var target = NormalizeBingWebLang(PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese));
+
+        using var http = CreateBrowserHttpClient(cfg);
+        var html = await http.GetStringAsync(baseUrl + "/translator").ConfigureAwait(false);
+
+        var ig = RegexMatch(html, "IG", @"IG:\s*['""']([A-Za-z0-9]+)['""']");
+        var abuse = Regex.Match(html, @"var\s+params_AbusePreventionHelper\s*=\s*\[\s*([0-9]+)\s*,\s*['""']([^'""']+)['""']", RegexOptions.IgnoreCase);
+        if (!abuse.Success)
+            throw new InvalidOperationException("Bing web 未找到 AbusePreventionHelper token，页面结构可能已变化。 ");
+        var key = abuse.Groups[1].Value;
+        var token = abuse.Groups[2].Value;
+        var iidMatch = Regex.Match(html, @"data-iid\s*=\s*['""']([^'""']+)['""']", RegexOptions.IgnoreCase);
+        var iid = iidMatch.Success ? iidMatch.Groups[1].Value : "translator.5028";
+
+        var url = $"{baseUrl}/ttranslatev3?isVertical=1&&IG={Uri.EscapeDataString(ig)}&IID={Uri.EscapeDataString(iid)}";
+        using var req = new HttpRequestMessage(HttpMethod.Post, url);
+        req.Headers.Referrer = new Uri(baseUrl + "/translator");
+        req.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["fromLang"] = string.IsNullOrWhiteSpace(cfg.SourceLang) ? "auto-detect" : NormalizeBingWebLang(cfg.SourceLang),
+            ["to"] = target,
+            ["token"] = token,
+            ["key"] = key,
+            ["text"] = text
+        });
+
+        using var resp = await http.SendAsync(req).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Bing web HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        using var doc = JsonDocument.Parse(body);
+        var translated = doc.RootElement[0].GetProperty("translations")[0].GetProperty("text").GetString() ?? "";
+        if (string.IsNullOrWhiteSpace(translated))
+            throw new InvalidOperationException("Bing web 返回空译文。 ");
+        return translated;
+    }
+
+    private static async Task<string> TranslateWithBaiduWebAsync(string text, TranslationConfig cfg)
+    {
+        var baseUrl = cfg.BaiduWebBaseUrl.TrimEnd('/');
+        var target = NormalizeBaiduWebLang(PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese));
+
+        using var http = CreateBrowserHttpClient(cfg);
+        var html = await http.GetStringAsync(baseUrl).ConfigureAwait(false);
+        var gtk = RegexMatch(html, "Baidu gtk", @"window\.gtk\s*=\s*['""']([^'""']+)['""']");
+        var token = RegexMatch(html, "Baidu token", @"token:\s*['""']([^'""']+)['""']");
+
+        var signText = text.Length > 30
+            ? SafeSlice(text, 0, 10) + SafeSlice(text, text.Length / 2 - 5, 10) + SafeSlice(text, text.Length - 10, 10)
+            : text;
+        var sign = BaiduWebTk(signText, gtk);
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/v2transapi");
+        req.Headers.Referrer = new Uri(baseUrl + "/");
+        req.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["from"] = string.IsNullOrWhiteSpace(cfg.SourceLang) ? "auto" : NormalizeBaiduWebLang(cfg.SourceLang),
+            ["to"] = target,
+            ["query"] = text,
+            ["simple_means_flag"] = "3",
+            ["sign"] = sign,
+            ["token"] = token,
+            ["domain"] = "common"
+        });
+
+        using var resp = await http.SendAsync(req).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Baidu web HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        if (root.TryGetProperty("errno", out var errno) && errno.ValueKind == JsonValueKind.Number && errno.GetInt32() != 0)
+            throw new InvalidOperationException("Baidu web errno=" + errno.GetInt32() + ": " + TrimError(body));
+
+        if (!root.TryGetProperty("trans_result", out var tr) || !tr.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException("Baidu web 返回中没有 trans_result.data：" + TrimError(body));
+
+        var translated = string.Join(Environment.NewLine,
+            data.EnumerateArray()
+                .Select(x => x.TryGetProperty("dst", out var dst) ? dst.GetString() : "")
+                .Where(x => !string.IsNullOrWhiteSpace(x)));
+        if (string.IsNullOrWhiteSpace(translated))
+            throw new InvalidOperationException("Baidu web 返回空译文。 ");
+        return translated;
+    }
+
+    private static async Task<string> TranslateWithIcibaWebAsync(string text, TranslationConfig cfg)
+    {
+        var target = NormalizeIcibaWebLang(PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese));
+        var sign = Md5Hex(cfg.IcibaWebSecretPrefix + text.Trim()).Substring(0, 16);
+
+        using var http = CreateBrowserHttpClient(cfg);
+        using var req = new HttpRequestMessage(HttpMethod.Post, cfg.IcibaWebEndpointPrefix + sign);
+        req.Headers.Referrer = new Uri("https://ifanyi.iciba.com/");
+        req.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["from"] = string.IsNullOrWhiteSpace(cfg.SourceLang) ? "auto" : NormalizeIcibaWebLang(cfg.SourceLang),
+            ["t"] = target,
+            ["q"] = text
+        });
+
+        using var resp = await http.SendAsync(req).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Iciba web HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        using var doc = JsonDocument.Parse(body);
+        if (!doc.RootElement.TryGetProperty("content", out var content) || !content.TryGetProperty("out", out var outText))
+            throw new InvalidOperationException("Iciba web 返回中没有 content.out：" + TrimError(body));
+
+        var translated = outText.GetString() ?? "";
+        if (string.IsNullOrWhiteSpace(translated))
+            throw new InvalidOperationException("Iciba web 返回空译文。 ");
+        return translated;
     }
 
     private static async Task<string> TranslateWithMyMemoryAsync(string text, TranslationConfig cfg)
@@ -754,6 +977,127 @@ internal static class Translator
         if ((target.StartsWith("ZH", StringComparison.OrdinalIgnoreCase) || target.Equals("zh", StringComparison.OrdinalIgnoreCase)) && LooksChinese(text))
             return string.IsNullOrWhiteSpace(alternateWhenChinese) ? "EN-US" : alternateWhenChinese.Trim();
         return target;
+    }
+
+    private static HttpClient CreateBrowserHttpClient(TranslationConfig cfg)
+    {
+        var handler = new HttpClientHandler
+        {
+            UseCookies = true,
+            AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate | System.Net.DecompressionMethods.Brotli
+        };
+        var http = new HttpClient(handler) { Timeout = TimeSpan.FromMilliseconds(Math.Max(1000, cfg.TimeoutMs)) };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd(string.IsNullOrWhiteSpace(cfg.WebUserAgent) ? "Mozilla/5.0" : cfg.WebUserAgent);
+        http.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7");
+        http.DefaultRequestHeaders.AcceptLanguage.ParseAdd("zh-CN,zh;q=0.9,en;q=0.8");
+        return http;
+    }
+
+    private static string RegexMatch(string input, string name, string pattern)
+    {
+        var m = Regex.Match(input, pattern, RegexOptions.IgnoreCase);
+        if (!m.Success)
+            throw new InvalidOperationException($"未找到 {name}，目标页面结构可能已变化。");
+        return m.Groups[1].Value;
+    }
+
+    private static string HtmlToText(string html)
+    {
+        var s = Regex.Replace(html, "<br\\s*/?>", "\n", RegexOptions.IgnoreCase);
+        s = Regex.Replace(s, "<.*?>", "", RegexOptions.Singleline);
+        return System.Net.WebUtility.HtmlDecode(s).Trim();
+    }
+
+    private static string SafeSlice(string s, int start, int length)
+    {
+        if (string.IsNullOrEmpty(s) || length <= 0) return "";
+        start = Math.Clamp(start, 0, s.Length);
+        length = Math.Clamp(length, 0, s.Length - start);
+        return s.Substring(start, length);
+    }
+
+    private static string BaiduWebTk(string text, string gtk)
+    {
+        var parts = gtk.Split('.');
+        if (parts.Length < 2 || !long.TryParse(parts[0], out var b) || !long.TryParse(parts[1], out var suffix))
+            throw new InvalidOperationException("Baidu gtk 格式异常：" + gtk);
+
+        var a = b;
+        foreach (var by in Encoding.UTF8.GetBytes(text))
+            a = BaiduFo(a + by, "+-a^+6");
+        a = BaiduFo(a, "+-3^+b+-f");
+        a ^= suffix;
+        if (a < 0) a = (a & 2147483647L) + 2147483648L;
+        a %= 1000000L;
+        return a + "." + (a ^ b);
+    }
+
+    private static long BaiduFo(long a, string b)
+    {
+        for (int c = 0; c < b.Length - 2; c += 3)
+        {
+            var dChar = b[c + 2];
+            var d = dChar >= 'a' ? dChar - 87 : dChar - '0';
+            var shifted = b[c + 1] == '+' ? (long)((uint)a >> d) : (a << d);
+            a = b[c] == '+' ? (a + shifted) & 4294967295L : a ^ shifted;
+        }
+        return a;
+    }
+
+    private static string NormalizeSogouWebLang(string lang)
+    {
+        lang = lang.Trim().ToLowerInvariant();
+        return lang switch
+        {
+            "zh" or "zh-cn" or "zh-hans" => "zh-CHS",
+            "zh-tw" or "zh-hant" or "cht" => "zh-CHT",
+            "en-us" or "en-gb" => "en",
+            "jp" => "ja",
+            "kr" => "ko",
+            _ => lang
+        };
+    }
+
+    private static string NormalizeBingWebLang(string lang)
+    {
+        lang = lang.Trim().ToLowerInvariant();
+        return lang switch
+        {
+            "zh" or "zh-cn" or "zh-hans" => "zh-Hans",
+            "zh-tw" or "zh-hant" or "cht" => "zh-Hant",
+            "en-us" or "en-gb" => "en",
+            "jp" => "ja",
+            _ => lang
+        };
+    }
+
+    private static string NormalizeBaiduWebLang(string lang)
+    {
+        lang = lang.Trim().ToLowerInvariant();
+        return lang switch
+        {
+            "zh" or "zh-cn" or "zh-hans" => "zh",
+            "zh-tw" or "zh-hant" or "cht" => "cht",
+            "en-us" or "en-gb" => "en",
+            "ja" => "jp",
+            "ko" => "kor",
+            "fr" => "fra",
+            "es" => "spa",
+            _ => lang
+        };
+    }
+
+    private static string NormalizeIcibaWebLang(string lang)
+    {
+        lang = lang.Trim().ToLowerInvariant();
+        return lang switch
+        {
+            "zh" or "zh-cn" or "zh-hans" => "zh",
+            "zh-tw" or "zh-hant" or "cht" => "cht",
+            "en-us" or "en-gb" => "en",
+            "jp" => "ja",
+            _ => lang
+        };
     }
 
     private static string NormalizeMicrosoftLang(string lang)

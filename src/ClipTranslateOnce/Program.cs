@@ -30,7 +30,7 @@ internal static class Program
 
             if (cli.ShowVersion)
             {
-                Console.WriteLine("ClipTranslateOnce 0.4.0");
+                Console.WriteLine("ClipTranslateOnce 0.5.0");
                 return 0;
             }
 
@@ -51,6 +51,11 @@ internal static class Program
                 raw = raw[..cfg.Input.MaxChars];
             }
 
+            if (!cli.NoOverlay)
+            {
+                return ShowOverlayAndTranslate(raw, cfg, cli);
+            }
+
             string translated;
             try
             {
@@ -58,11 +63,6 @@ internal static class Program
             }
             catch (Exception ex)
             {
-                translated = "翻译失败：" + ex.Message + Environment.NewLine + Environment.NewLine + raw;
-                if (!cli.NoOverlay)
-                {
-                    ShowOverlay(translated, cfg.Overlay);
-                }
                 Console.Error.WriteLine("翻译失败：" + ex.Message);
                 return 3;
             }
@@ -73,11 +73,6 @@ internal static class Program
                 Console.WriteLine(translated);
             }
 
-            if (!cli.NoOverlay)
-            {
-                ShowOverlay(translated, cfg.Overlay);
-            }
-
             return 0;
         }
         catch (Exception ex)
@@ -85,6 +80,39 @@ internal static class Program
             Console.Error.WriteLine("执行失败：" + ex.Message);
             return 1;
         }
+    }
+
+    private static int ShowOverlayAndTranslate(string raw, AppConfig cfg, CliOptions cli)
+    {
+        var exitCode = 0;
+        using var form = new OverlayForm(cfg.Overlay.LoadingText, cfg.Overlay);
+
+        form.Shown += async (_, _) =>
+        {
+            try
+            {
+                var translated = await Translator.TranslateAsync(raw, cfg.Translation).ConfigureAwait(true);
+                if (!form.IsDisposed) form.SetText(translated);
+
+                if (cli.Print)
+                {
+                    Console.OutputEncoding = Encoding.UTF8;
+                    Console.WriteLine(translated);
+                }
+            }
+            catch (Exception ex)
+            {
+                exitCode = 3;
+                var fallback = cfg.Overlay.ShowSourceOnFailure
+                    ? "翻译失败：" + ex.Message + Environment.NewLine + Environment.NewLine + raw
+                    : "翻译失败：" + ex.Message;
+                if (!form.IsDisposed) form.SetText(fallback);
+                Console.Error.WriteLine("翻译失败：" + ex.Message);
+            }
+        };
+
+        Application.Run(form);
+        return exitCode;
     }
 
     private static string AcquireText(CliOptions cli, InputConfig cfg)
@@ -143,6 +171,7 @@ internal sealed class CliOptions
     public bool NoOverlay { get; private set; }
     public bool? MergePdfLineBreaks { get; private set; }
     public string? Text { get; private set; }
+    public bool CommandMode { get; private set; }
     public string? FilePath { get; private set; }
     public string? ConfigPath { get; private set; }
     public string? InputModeOverride { get; private set; }
@@ -183,6 +212,15 @@ internal sealed class CliOptions
                 case "--merge-pdf-lines":
                     opt.MergePdfLineBreaks = true;
                     break;
+                case "--command":
+                case "-command":
+                case "--commend":
+                case "-commend":
+                case "-c":
+                    opt.Text = DecodeCommandText(string.Join(" ", args.Skip(i + 1)));
+                    opt.CommandMode = true;
+                    i = args.Length;
+                    break;
                 case "--clipboard":
                     opt.InputModeOverride = "clipboard";
                     break;
@@ -217,7 +255,11 @@ internal sealed class CliOptions
                     else throw new ArgumentException("--max-chars 必须是整数。");
                     break;
                 default:
-                    if (a.StartsWith("--text=", StringComparison.Ordinal)) opt.Text = a[7..];
+                    if (a.StartsWith("--command=", StringComparison.Ordinal)) { opt.Text = DecodeCommandText(a[10..]); opt.CommandMode = true; }
+                    else if (a.StartsWith("-command=", StringComparison.Ordinal)) { opt.Text = DecodeCommandText(a[9..]); opt.CommandMode = true; }
+                    else if (a.StartsWith("--commend=", StringComparison.Ordinal)) { opt.Text = DecodeCommandText(a[10..]); opt.CommandMode = true; }
+                    else if (a.StartsWith("-commend=", StringComparison.Ordinal)) { opt.Text = DecodeCommandText(a[9..]); opt.CommandMode = true; }
+                    else if (a.StartsWith("--text=", StringComparison.Ordinal)) opt.Text = a[7..];
                     else if (a.StartsWith("--file=", StringComparison.Ordinal)) opt.FilePath = a[7..];
                     else if (a.StartsWith("--config=", StringComparison.Ordinal)) opt.ConfigPath = a[9..];
                     else if (a.StartsWith("--provider=", StringComparison.Ordinal)) opt.Provider = a[11..];
@@ -252,6 +294,16 @@ internal sealed class CliOptions
         if (MergePdfLineBreaks is not null) cfg.Input.MergePdfLineBreaks = MergePdfLineBreaks.Value;
     }
 
+    private static string DecodeCommandText(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        return text
+            .Replace("\\r\\n", "\n", StringComparison.Ordinal)
+            .Replace("\\n", "\n", StringComparison.Ordinal)
+            .Replace("\\r", "\r", StringComparison.Ordinal)
+            .Replace("\\t", "\t", StringComparison.Ordinal);
+    }
+
     private static string NeedValue(string[] args, ref int i, string name)
     {
         if (i + 1 >= args.Length) throw new ArgumentException($"{name} 缺少参数值。");
@@ -271,12 +323,14 @@ ClipTranslateOnce - 单次调用的低资源浮层翻译工具
   ClipTranslateOnce.exe --clipboard
   ClipTranslateOnce.exe --file input.txt
   Get-Content -Raw input.txt | ClipTranslateOnce.exe --stdin
+  ClipTranslateOnce.exe -commend "This is a test.\nSecond line."
   "This is a test." | ClipTranslateOnce.exe --stdin
 
 输入选项：
   --stdin                 从标准输入读取。最适合长文本、多行文本、特殊字符文本。
   -f, --file <path>       从 UTF-8 文本文件读取。
   -t, --text <text>       从一个命令行参数读取文本。短文本可用，长文本不推荐。
+  -c, --command <text>    将该参数后的所有剩余命令行片段作为文本；兼容 -command、-commend。字面量 \n 会转为真实换行。
   --clipboard             直接读取剪切板文本。
   --selected              模拟 Ctrl+C 读取当前选中文本，然后尽量恢复剪切板。
   --auto                  先尝试 selected，失败后读取 clipboard。
@@ -297,7 +351,8 @@ ClipTranslateOnce - 单次调用的低资源浮层翻译工具
   --version               显示版本。
 
 说明：
-  对长文本、多行文本、含引号/括号/换行/特殊符号的文本，优先使用 --stdin 或 --file，避免命令行转义问题。
+  对长文本、多行文本、含引号/括号/换行/特殊符号的文本，优先使用 --stdin、--file 或 -commend。
+  但 &、|、<、> 等会被 shell 预处理的字符仍需在调用侧引用、转义，或改用 --stdin / --file。
 """;
 }
 
@@ -359,7 +414,7 @@ internal sealed record TranslationConfig
     public int TimeoutMs { get; set; } = 8000;
 
     // 无需手动申请密钥的实验性后端。它们主要来自公共网页接口或页面解析，稳定性弱于正式 API。
-    public string KeylessFallbackProviders { get; set; } = "mymemory,youdao-mobile,bing-web,sogou-page,iciba-web";
+    public string KeylessFallbackProviders { get; set; } = "youdao-mobile,mymemory,bing-web,iciba-web,sogou-page";
     public string WebUserAgent { get; set; } = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
     public string YoudaoMobileEndpoint { get; set; } = "http://m.youdao.com/translate";
     public string SogouPageEndpoint { get; set; } = "https://fanyi.sogou.com/text";
@@ -401,16 +456,23 @@ internal sealed record TranslationConfig
 
 internal sealed record OverlayConfig
 {
-    public int MaxWidthPx { get; set; } = 620;
-    public int MaxHeightPx { get; set; } = 520;
-    public int MinWidthPx { get; set; } = 220;
-    public int PaddingPx { get; set; } = 14;
+    public int MaxWidthPx { get; set; } = 720;
+    public int MaxHeightPx { get; set; } = 560;
+    public int MinWidthPx { get; set; } = 260;
+    public int PaddingPx { get; set; } = 8;
     public int OffsetX { get; set; } = 16;
     public int OffsetY { get; set; } = 18;
-    public double Opacity { get; set; } = 0.96;
+    public double Opacity { get; set; } = 0.94;
+    public string BackgroundColor { get; set; } = "#FAFAFA";
+    public string TextColor { get; set; } = "#111111";
+    public string CloseButtonColor { get; set; } = "#555555";
     public string FontName { get; set; } = "Microsoft YaHei UI";
-    public float FontSize { get; set; } = 10.5f;
+    public float FontSize { get; set; } = 12.5f;
+    public int CloseButtonSizePx { get; set; } = 18;
     public bool CopyOnRightClick { get; set; } = true;
+    public bool CloseOnRightClickCopy { get; set; } = false;
+    public string LoadingText { get; set; } = "翻译中...";
+    public bool ShowSourceOnFailure { get; set; } = true;
 }
 
 internal static class TextInput
@@ -590,7 +652,7 @@ internal static class Translator
 
     private static async Task<string> TranslateWithKeylessAutoAsync(string text, TranslationConfig cfg)
     {
-        var providers = (cfg.KeylessFallbackProviders ?? "mymemory,youdao-mobile,bing-web,sogou-page,iciba-web")
+        var providers = (cfg.KeylessFallbackProviders ?? "youdao-mobile,mymemory,bing-web,iciba-web,sogou-page")
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Where(p => !p.Equals("keyless", StringComparison.OrdinalIgnoreCase)
                      && !p.Equals("auto-keyless", StringComparison.OrdinalIgnoreCase)
@@ -1185,8 +1247,9 @@ internal sealed class OverlayForm : Form
     private const int WS_EX_TOOLWINDOW = 0x00000080;
     private const int WS_EX_NOACTIVATE = 0x08000000;
 
-    private readonly string _text;
+    private string _text;
     private readonly OverlayConfig _cfg;
+    private bool _positioned;
 
     protected override bool ShowWithoutActivation => true;
 
@@ -1205,7 +1268,20 @@ internal sealed class OverlayForm : Form
         _text = text;
         _cfg = cfg;
         ConfigureWindow();
-        BuildContent();
+        RebuildContent(positionNearCursor: true);
+    }
+
+    public void SetText(string text)
+    {
+        if (IsDisposed) return;
+        if (InvokeRequired)
+        {
+            try { BeginInvoke(new Action(() => SetText(text))); } catch { }
+            return;
+        }
+
+        _text = text;
+        RebuildContent(positionNearCursor: false);
     }
 
     private void ConfigureWindow()
@@ -1214,56 +1290,62 @@ internal sealed class OverlayForm : Form
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
         TopMost = true;
-        Opacity = Math.Clamp(_cfg.Opacity, 0.55, 1.0);
-        BackColor = Color.FromArgb(250, 250, 250);
-        Padding = new Padding(_cfg.PaddingPx);
+        DoubleBuffered = true;
+        Opacity = Math.Clamp(_cfg.Opacity, 0.30, 1.0);
+        BackColor = ParseColor(_cfg.BackgroundColor, Color.FromArgb(250, 250, 250));
+        Padding = Padding.Empty;
+        Cursor = Cursors.SizeAll;
     }
 
-    private void BuildContent()
+    private void RebuildContent(bool positionNearCursor)
     {
-        var font = new Font(_cfg.FontName, _cfg.FontSize, FontStyle.Regular, GraphicsUnit.Point);
-        int closeSize = 24;
-        int textMaxWidth = Math.Max(_cfg.MinWidthPx, _cfg.MaxWidthPx - _cfg.PaddingPx * 2);
+        var previousLocation = Location;
+        Controls.Clear();
+
+        var padding = Math.Clamp(_cfg.PaddingPx, 2, 48);
+        var closeSize = Math.Clamp(_cfg.CloseButtonSizePx, 12, 32);
+        var maxWidth = Math.Max(_cfg.MinWidthPx, _cfg.MaxWidthPx);
+        var maxHeight = Math.Max(80, _cfg.MaxHeightPx);
+        var minWidth = Math.Clamp(_cfg.MinWidthPx, 80, maxWidth);
+        var fontSize = Math.Clamp(_cfg.FontSize, 7f, 36f);
+
+        using var measureFont = new Font(_cfg.FontName, fontSize, FontStyle.Regular, GraphicsUnit.Point);
+        int textMaxWidth = Math.Max(80, maxWidth - padding * 2);
+        int textMaxHeight = Math.Max(60, maxHeight - padding * 2);
 
         var measured = TextRenderer.MeasureText(
             _text,
-            font,
+            measureFont,
             new Size(textMaxWidth, int.MaxValue),
-            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding | TextFormatFlags.TextBoxControl);
 
-        int contentWidth = Math.Clamp(measured.Width + 10, _cfg.MinWidthPx, _cfg.MaxWidthPx);
-        int contentHeight = Math.Min(measured.Height + 8, _cfg.MaxHeightPx - closeSize - _cfg.PaddingPx * 2);
-        int formWidth = contentWidth + _cfg.PaddingPx * 2;
-        int formHeight = contentHeight + closeSize + _cfg.PaddingPx * 2;
+        int contentWidth = Math.Clamp(measured.Width + 4, minWidth - padding * 2, textMaxWidth);
+        int contentHeight = Math.Min(measured.Height + 4, textMaxHeight);
+        int formWidth = Math.Clamp(contentWidth + padding * 2, minWidth, maxWidth);
+        int formHeight = Math.Clamp(contentHeight + padding * 2, 42, maxHeight);
         Size = new Size(formWidth, formHeight);
-
-        var close = new Label
-        {
-            Text = "×",
-            Font = new Font(_cfg.FontName, 12f, FontStyle.Bold, GraphicsUnit.Point),
-            TextAlign = ContentAlignment.MiddleCenter,
-            Cursor = Cursors.Hand,
-            BackColor = Color.Transparent,
-            Bounds = new Rectangle(formWidth - _cfg.PaddingPx - closeSize, _cfg.PaddingPx - 4, closeSize, closeSize)
-        };
-        close.Click += (_, _) => Close();
-        Controls.Add(close);
 
         var panel = new Panel
         {
-            AutoScroll = measured.Height + 8 > contentHeight,
-            Bounds = new Rectangle(_cfg.PaddingPx, _cfg.PaddingPx + closeSize, contentWidth, contentHeight),
-            BackColor = Color.Transparent
+            AutoScroll = measured.Height + 4 > contentHeight,
+            Bounds = new Rectangle(padding, padding, formWidth - padding * 2, formHeight - padding * 2),
+            BackColor = Color.Transparent,
+            Cursor = Cursors.SizeAll
         };
+        panel.MouseDown += BeginDrag;
 
         var label = new Label
         {
             Text = _text,
-            Font = font,
+            Font = new Font(_cfg.FontName, fontSize, FontStyle.Regular, GraphicsUnit.Point),
+            ForeColor = ParseColor(_cfg.TextColor, Color.FromArgb(17, 17, 17)),
             AutoSize = true,
-            MaximumSize = new Size(contentWidth - 6, 0),
-            BackColor = Color.Transparent
+            MaximumSize = new Size(Math.Max(40, panel.Width - 4), 0),
+            BackColor = Color.Transparent,
+            Cursor = Cursors.SizeAll,
+            UseCompatibleTextRendering = false
         };
+        label.MouseDown += BeginDrag;
 
         if (_cfg.CopyOnRightClick)
         {
@@ -1273,14 +1355,48 @@ internal sealed class OverlayForm : Form
 
         panel.Controls.Add(label);
         Controls.Add(panel);
-        PositionNearCursor();
+
+        var close = new Label
+        {
+            Text = "×",
+            Font = new Font(_cfg.FontName, Math.Max(9f, fontSize), FontStyle.Bold, GraphicsUnit.Point),
+            ForeColor = ParseColor(_cfg.CloseButtonColor, Color.FromArgb(85, 85, 85)),
+            TextAlign = ContentAlignment.MiddleCenter,
+            Cursor = Cursors.Hand,
+            BackColor = Color.Transparent,
+            Bounds = new Rectangle(formWidth - closeSize - 2, 1, closeSize, closeSize)
+        };
+        close.Click += (_, _) => Close();
+        Controls.Add(close);
+        close.BringToFront();
+
+        MouseDown -= BeginDrag;
+        MouseDown += BeginDrag;
+
+        if (positionNearCursor || !_positioned)
+        {
+            PositionNearCursor();
+            _positioned = true;
+        }
+        else
+        {
+            Location = previousLocation;
+            KeepInsideWorkingArea();
+        }
+    }
+
+    private void BeginDrag(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        NativeMethods.ReleaseCapture();
+        NativeMethods.SendMessage(Handle, NativeMethods.WM_NCLBUTTONDOWN, NativeMethods.HTCAPTION, IntPtr.Zero);
     }
 
     private void CopyOnRightClick(MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Right) return;
         try { Clipboard.SetText(_text); } catch { }
-        Close();
+        if (_cfg.CloseOnRightClickCopy) Close();
     }
 
     private void PositionNearCursor()
@@ -1298,10 +1414,32 @@ internal sealed class OverlayForm : Form
 
         Location = new Point(x, y);
     }
+
+    private void KeepInsideWorkingArea()
+    {
+        var screen = Screen.FromPoint(Location).WorkingArea;
+        int x = Math.Clamp(Left, screen.Left, Math.Max(screen.Left, screen.Right - Width));
+        int y = Math.Clamp(Top, screen.Top, Math.Max(screen.Top, screen.Bottom - Height));
+        Location = new Point(x, y);
+    }
+
+    private static Color ParseColor(string? value, Color fallback)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return fallback;
+        try { return ColorTranslator.FromHtml(value.Trim()); }
+        catch
+        {
+            var c = Color.FromName(value.Trim());
+            return (c.IsKnownColor || c.IsNamedColor) && c.A != 0 ? c : fallback;
+        }
+    }
 }
 
 internal static class NativeMethods
 {
+    public const int WM_NCLBUTTONDOWN = 0x00A1;
+    public static readonly IntPtr HTCAPTION = new(2);
+
     private const uint INPUT_KEYBOARD = 1;
     private const ushort VK_CONTROL = 0x11;
     private const ushort VK_C = 0x43;
@@ -1315,6 +1453,12 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")]
     public static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    public static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
     public static void SendCtrlC()
     {

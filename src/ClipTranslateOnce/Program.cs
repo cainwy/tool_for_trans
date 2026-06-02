@@ -1,0 +1,831 @@
+using System.Diagnostics;
+using System.Drawing;
+using System.Net.Http.Headers;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Windows.Forms;
+
+namespace ClipTranslateOnce;
+
+internal static class Program
+{
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        try
+        {
+            Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            var cli = CliOptions.Parse(args);
+            if (cli.ShowHelp)
+            {
+                Console.WriteLine(HelpText.Text);
+                return 0;
+            }
+
+            if (cli.ShowVersion)
+            {
+                Console.WriteLine("ClipTranslateOnce 0.2.0");
+                return 0;
+            }
+
+            var cfg = AppConfig.LoadOrCreate(cli.ConfigPath);
+            cli.ApplyTo(cfg);
+
+            string raw = AcquireText(cli, cfg.Input);
+            raw = TextCleaner.Clean(raw, cfg.Input.MergePdfLineBreaks, cfg.Input.PreserveCodeLikeText);
+
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                Fail("没有读取到可翻译文本。", cfg, cli, 2);
+                return 2;
+            }
+
+            if (raw.Length > cfg.Input.MaxChars)
+            {
+                raw = raw[..cfg.Input.MaxChars];
+            }
+
+            string translated;
+            try
+            {
+                translated = Translator.TranslateAsync(raw, cfg.Translation).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                translated = "翻译失败：" + ex.Message + Environment.NewLine + Environment.NewLine + raw;
+                if (!cli.NoOverlay)
+                {
+                    ShowOverlay(translated, cfg.Overlay);
+                }
+                Console.Error.WriteLine("翻译失败：" + ex.Message);
+                return 3;
+            }
+
+            if (cli.Print)
+            {
+                Console.OutputEncoding = Encoding.UTF8;
+                Console.WriteLine(translated);
+            }
+
+            if (!cli.NoOverlay)
+            {
+                ShowOverlay(translated, cfg.Overlay);
+            }
+
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("执行失败：" + ex.Message);
+            return 1;
+        }
+    }
+
+    private static string AcquireText(CliOptions cli, InputConfig cfg)
+    {
+        if (cli.Text is not null) return cli.Text;
+
+        if (cli.FilePath is not null)
+        {
+            var path = Environment.ExpandEnvironmentVariables(cli.FilePath);
+            return File.ReadAllText(path, Encoding.UTF8);
+        }
+
+        if (cli.ReadStdin)
+        {
+            if (!Console.IsInputRedirected)
+                throw new InvalidOperationException("指定了 --stdin，但当前没有重定向/管道输入。建议使用：Get-Content -Raw input.txt | ClipTranslateOnce.exe --stdin");
+            Console.InputEncoding = Encoding.UTF8;
+            return Console.In.ReadToEnd();
+        }
+
+        if (cli.InputModeOverride is not null)
+        {
+            return TextInput.Acquire(cfg with { Mode = cli.InputModeOverride });
+        }
+
+        if (cli.PositionalText.Count > 0)
+        {
+            return string.Join(" ", cli.PositionalText);
+        }
+
+        return TextInput.Acquire(cfg);
+    }
+
+    private static void Fail(string message, AppConfig cfg, CliOptions cli, int exitCode)
+    {
+        Console.Error.WriteLine(message);
+        if (!cli.NoOverlay)
+        {
+            ShowOverlay(message, cfg.Overlay);
+        }
+    }
+
+    private static void ShowOverlay(string text, OverlayConfig overlay)
+    {
+        using var form = new OverlayForm(text, overlay);
+        Application.Run(form);
+    }
+}
+
+internal sealed class CliOptions
+{
+    public bool ShowHelp { get; private set; }
+    public bool ShowVersion { get; private set; }
+    public bool ReadStdin { get; private set; }
+    public bool Print { get; private set; }
+    public bool NoOverlay { get; private set; }
+    public bool? MergePdfLineBreaks { get; private set; }
+    public string? Text { get; private set; }
+    public string? FilePath { get; private set; }
+    public string? ConfigPath { get; private set; }
+    public string? InputModeOverride { get; private set; }
+    public string? Provider { get; private set; }
+    public string? TargetLang { get; private set; }
+    public string? SourceLang { get; private set; }
+    public int? MaxChars { get; private set; }
+    public List<string> PositionalText { get; } = new();
+
+    public static CliOptions Parse(string[] args)
+    {
+        var opt = new CliOptions();
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            switch (a)
+            {
+                case "-h":
+                case "--help":
+                    opt.ShowHelp = true;
+                    break;
+                case "--version":
+                    opt.ShowVersion = true;
+                    break;
+                case "--stdin":
+                    opt.ReadStdin = true;
+                    break;
+                case "--print":
+                    opt.Print = true;
+                    break;
+                case "--no-overlay":
+                    opt.NoOverlay = true;
+                    break;
+                case "--raw":
+                    opt.MergePdfLineBreaks = false;
+                    break;
+                case "--merge-pdf-lines":
+                    opt.MergePdfLineBreaks = true;
+                    break;
+                case "--clipboard":
+                    opt.InputModeOverride = "clipboard";
+                    break;
+                case "--selected":
+                    opt.InputModeOverride = "selected";
+                    break;
+                case "--auto":
+                    opt.InputModeOverride = "auto";
+                    break;
+                case "--text":
+                case "-t":
+                    opt.Text = NeedValue(args, ref i, a);
+                    break;
+                case "--file":
+                case "-f":
+                    opt.FilePath = NeedValue(args, ref i, a);
+                    break;
+                case "--config":
+                    opt.ConfigPath = NeedValue(args, ref i, a);
+                    break;
+                case "--provider":
+                    opt.Provider = NeedValue(args, ref i, a);
+                    break;
+                case "--target":
+                    opt.TargetLang = NeedValue(args, ref i, a);
+                    break;
+                case "--source":
+                    opt.SourceLang = NeedValue(args, ref i, a);
+                    break;
+                case "--max-chars":
+                    if (int.TryParse(NeedValue(args, ref i, a), out var n)) opt.MaxChars = n;
+                    else throw new ArgumentException("--max-chars 必须是整数。");
+                    break;
+                default:
+                    if (a.StartsWith("--text=", StringComparison.Ordinal)) opt.Text = a[7..];
+                    else if (a.StartsWith("--file=", StringComparison.Ordinal)) opt.FilePath = a[7..];
+                    else if (a.StartsWith("--config=", StringComparison.Ordinal)) opt.ConfigPath = a[9..];
+                    else if (a.StartsWith("--provider=", StringComparison.Ordinal)) opt.Provider = a[11..];
+                    else if (a.StartsWith("--target=", StringComparison.Ordinal)) opt.TargetLang = a[9..];
+                    else if (a.StartsWith("--source=", StringComparison.Ordinal)) opt.SourceLang = a[9..];
+                    else if (a.StartsWith("--", StringComparison.Ordinal)) throw new ArgumentException("未知参数：" + a);
+                    else opt.PositionalText.Add(a);
+                    break;
+            }
+        }
+
+        var explicitInputs = 0;
+        if (opt.Text is not null) explicitInputs++;
+        if (opt.FilePath is not null) explicitInputs++;
+        if (opt.ReadStdin) explicitInputs++;
+        if (opt.InputModeOverride is not null) explicitInputs++;
+        if (opt.PositionalText.Count > 0) explicitInputs++;
+        if (explicitInputs > 1)
+            throw new ArgumentException("输入来源不能同时指定多个。请选择 --stdin、--file、--text、--clipboard、--selected、--auto 或位置参数中的一种。");
+
+        if (opt.NoOverlay) opt.Print = true;
+
+        return opt;
+    }
+
+    public void ApplyTo(AppConfig cfg)
+    {
+        if (Provider is not null) cfg.Translation.Provider = Provider;
+        if (TargetLang is not null) cfg.Translation.TargetLang = TargetLang;
+        if (SourceLang is not null) cfg.Translation.SourceLang = SourceLang;
+        if (MaxChars is not null) cfg.Input.MaxChars = Math.Max(1, MaxChars.Value);
+        if (MergePdfLineBreaks is not null) cfg.Input.MergePdfLineBreaks = MergePdfLineBreaks.Value;
+    }
+
+    private static string NeedValue(string[] args, ref int i, string name)
+    {
+        if (i + 1 >= args.Length) throw new ArgumentException($"{name} 缺少参数值。");
+        return args[++i];
+    }
+}
+
+internal static class HelpText
+{
+    public const string Text = """
+ClipTranslateOnce - 单次调用的低资源浮层翻译工具
+
+用法：
+  ClipTranslateOnce.exe [选项] [文本]
+
+推荐输入方式：
+  ClipTranslateOnce.exe --clipboard
+  ClipTranslateOnce.exe --file input.txt
+  Get-Content -Raw input.txt | ClipTranslateOnce.exe --stdin
+  "This is a test." | ClipTranslateOnce.exe --stdin
+
+输入选项：
+  --stdin                 从标准输入读取。最适合长文本、多行文本、特殊字符文本。
+  -f, --file <path>       从 UTF-8 文本文件读取。
+  -t, --text <text>       从一个命令行参数读取文本。短文本可用，长文本不推荐。
+  --clipboard             直接读取剪切板文本。
+  --selected              模拟 Ctrl+C 读取当前选中文本，然后尽量恢复剪切板。
+  --auto                  先尝试 selected，失败后读取 clipboard。
+
+翻译选项：
+  --provider <name>       deepl | libretranslate | echo
+  --target <lang>         目标语言，例如 ZH-HANS、EN-US、JA、zh、en。
+  --source <lang>         源语言。留空时由翻译后端自动检测。
+  --max-chars <n>         最大输入字符数。
+
+输出选项：
+  --print                 同时把译文输出到控制台。
+  --no-overlay            不显示浮层，只配合 --print 使用。
+  --raw                   不合并 PDF 复制产生的断行。
+  --merge-pdf-lines       合并 PDF 复制产生的断行。
+  --config <path>         指定配置文件路径。
+  -h, --help              显示帮助。
+  --version               显示版本。
+
+说明：
+  对长文本、多行文本、含引号/括号/换行/特殊符号的文本，优先使用 --stdin 或 --file，避免命令行转义问题。
+""";
+}
+
+internal sealed record AppConfig
+{
+    public InputConfig Input { get; set; } = new();
+    public TranslationConfig Translation { get; set; } = new();
+    public OverlayConfig Overlay { get; set; } = new();
+
+    public static AppConfig LoadOrCreate(string? explicitPath)
+    {
+        var path = ResolveConfigPath(explicitPath);
+        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true, WriteIndented = true };
+
+        if (!File.Exists(path))
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path) ?? AppContext.BaseDirectory);
+            var cfg = new AppConfig();
+            File.WriteAllText(path, JsonSerializer.Serialize(cfg, options), new UTF8Encoding(false));
+            return cfg;
+        }
+
+        var json = File.ReadAllText(path, Encoding.UTF8);
+        return JsonSerializer.Deserialize<AppConfig>(json, options) ?? new AppConfig();
+    }
+
+    private static string ResolveConfigPath(string? explicitPath)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitPath))
+            return Path.GetFullPath(Environment.ExpandEnvironmentVariables(explicitPath));
+
+        var local = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+        if (File.Exists(local)) return local;
+
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        return Path.Combine(appData, "ClipTranslateOnce", "appsettings.json");
+    }
+}
+
+internal sealed record InputConfig
+{
+    // selected: 模拟 Ctrl+C 读取当前选区；clipboard: 直接读取剪切板；auto: 先 selected，失败再 clipboard。
+    public string Mode { get; set; } = "clipboard";
+    public int CopyDelayMs { get; set; } = 160;
+    public int CopyTimeoutMs { get; set; } = 900;
+    public bool RestoreClipboard { get; set; } = true;
+    public int MaxChars { get; set; } = 5000;
+    public bool MergePdfLineBreaks { get; set; } = true;
+    public bool PreserveCodeLikeText { get; set; } = true;
+}
+
+internal sealed record TranslationConfig
+{
+    // deepl | libretranslate | echo
+    public string Provider { get; set; } = "deepl";
+    public string TargetLang { get; set; } = "ZH-HANS";
+    public string AlternateTargetLangWhenInputLooksChinese { get; set; } = "EN-US";
+    public string SourceLang { get; set; } = "";
+    public string ApiKeyEnv { get; set; } = "DEEPL_API_KEY";
+    public string ApiKey { get; set; } = "";
+    public string Endpoint { get; set; } = "https://api-free.deepl.com/v2/translate";
+    public int TimeoutMs { get; set; } = 8000;
+    public string DeeplModelType { get; set; } = "latency_optimized";
+    public string DeeplSplitSentences { get; set; } = "nonewlines";
+    public string LibreTranslateEndpoint { get; set; } = "http://127.0.0.1:5000/translate";
+    public string LibreTranslateApiKey { get; set; } = "";
+}
+
+internal sealed record OverlayConfig
+{
+    public int MaxWidthPx { get; set; } = 620;
+    public int MaxHeightPx { get; set; } = 520;
+    public int MinWidthPx { get; set; } = 220;
+    public int PaddingPx { get; set; } = 14;
+    public int OffsetX { get; set; } = 16;
+    public int OffsetY { get; set; } = 18;
+    public double Opacity { get; set; } = 0.96;
+    public string FontName { get; set; } = "Microsoft YaHei UI";
+    public float FontSize { get; set; } = 10.5f;
+    public bool CopyOnRightClick { get; set; } = true;
+}
+
+internal static class TextInput
+{
+    public static string Acquire(InputConfig cfg)
+    {
+        var mode = (cfg.Mode ?? "clipboard").Trim().ToLowerInvariant();
+        return mode switch
+        {
+            "selected" => TryGetSelectedText(cfg) ?? "",
+            "auto" => TryGetSelectedText(cfg) is { Length: > 0 } s ? s : GetClipboardText(),
+            _ => GetClipboardText()
+        };
+    }
+
+    private static string? TryGetSelectedText(InputConfig cfg)
+    {
+        IDataObject? oldClipboard = null;
+        bool hadClipboard = false;
+        uint beforeSeq = NativeMethods.GetClipboardSequenceNumber();
+
+        if (cfg.RestoreClipboard)
+        {
+            try
+            {
+                oldClipboard = Clipboard.GetDataObject();
+                hadClipboard = oldClipboard is not null;
+            }
+            catch
+            {
+                // Clipboard may be locked by another process.
+            }
+        }
+
+        NativeMethods.SendCtrlC();
+        Thread.Sleep(Math.Max(0, cfg.CopyDelayMs));
+
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < cfg.CopyTimeoutMs)
+        {
+            if (NativeMethods.GetClipboardSequenceNumber() != beforeSeq) break;
+            Thread.Sleep(25);
+        }
+
+        string text = GetClipboardText();
+
+        if (cfg.RestoreClipboard)
+        {
+            try
+            {
+                if (hadClipboard && oldClipboard is not null)
+                    Clipboard.SetDataObject(oldClipboard, true);
+                else
+                    Clipboard.Clear();
+            }
+            catch
+            {
+                // Do not fail translation only because clipboard restoration failed.
+            }
+        }
+
+        return text;
+    }
+
+    private static string GetClipboardText()
+    {
+        for (int i = 0; i < 6; i++)
+        {
+            try
+            {
+                return Clipboard.ContainsText(TextDataFormat.UnicodeText)
+                    ? Clipboard.GetText(TextDataFormat.UnicodeText)
+                    : "";
+            }
+            catch
+            {
+                Thread.Sleep(50);
+            }
+        }
+        return "";
+    }
+}
+
+internal static class TextCleaner
+{
+    public static string Clean(string text, bool mergePdfLineBreaks, bool preserveCodeLikeText)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+
+        var s = text.Replace("\r\n", "\n").Replace("\r", "\n").Trim();
+        if (!mergePdfLineBreaks) return s;
+        if (preserveCodeLikeText && LooksCodeLike(s)) return s;
+
+        var paragraphs = Regex.Split(s, "\\n{2,}")
+            .Select(MergeSingleParagraph)
+            .Where(p => !string.IsNullOrWhiteSpace(p));
+
+        return string.Join("\n\n", paragraphs).Trim();
+    }
+
+    private static string MergeSingleParagraph(string para)
+    {
+        var lines = para.Split('\n')
+            .Select(x => x.Trim())
+            .Where(x => x.Length > 0)
+            .ToArray();
+
+        if (lines.Length <= 1) return para.Trim();
+
+        var sb = new StringBuilder();
+        foreach (var line in lines)
+        {
+            if (sb.Length == 0)
+            {
+                sb.Append(line);
+                continue;
+            }
+
+            if (Regex.IsMatch(line, @"^([-*•]|\d+[.)])\s+"))
+            {
+                sb.Append('\n').Append(line);
+            }
+            else if (sb[^1] == '-')
+            {
+                sb.Length -= 1;
+                sb.Append(line);
+            }
+            else
+            {
+                sb.Append(' ').Append(line);
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    private static bool LooksCodeLike(string s)
+    {
+        var lines = s.Split('\n');
+        if (lines.Length < 3) return false;
+
+        int codeSignals = 0;
+        foreach (var line in lines.Take(30))
+        {
+            var t = line.Trim();
+            if (t.StartsWith("using ") || t.StartsWith("namespace ") || t.StartsWith("public ") || t.StartsWith("private ")) codeSignals++;
+            if (Regex.IsMatch(t, @"[{};=<>]|^#include|^import\s|^def\s|^class\s|^function\s|^var\s|^let\s|^const\s")) codeSignals++;
+            if (Regex.IsMatch(line, @"^\s{2,}\S")) codeSignals++;
+        }
+
+        return codeSignals >= 4;
+    }
+}
+
+internal static class Translator
+{
+    public static Task<string> TranslateAsync(string text, TranslationConfig cfg)
+    {
+        var provider = (cfg.Provider ?? "deepl").Trim().ToLowerInvariant();
+        return provider switch
+        {
+            "echo" => Task.FromResult(text),
+            "libretranslate" => TranslateWithLibreAsync(text, cfg),
+            _ => TranslateWithDeepLAsync(text, cfg)
+        };
+    }
+
+    private static async Task<string> TranslateWithDeepLAsync(string text, TranslationConfig cfg)
+    {
+        var apiKey = GetApiKey(cfg);
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new InvalidOperationException($"没有配置 DeepL API key。请设置环境变量 {cfg.ApiKeyEnv}，或在 appsettings.json 的 translation.apiKey 中填写。调试时可把 provider 改为 echo。");
+
+        var target = PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese);
+
+        var payload = new Dictionary<string, object?>
+        {
+            ["text"] = new[] { text },
+            ["target_lang"] = target
+        };
+        if (!string.IsNullOrWhiteSpace(cfg.SourceLang)) payload["source_lang"] = cfg.SourceLang.Trim();
+        if (!string.IsNullOrWhiteSpace(cfg.DeeplModelType)) payload["model_type"] = cfg.DeeplModelType.Trim();
+        if (!string.IsNullOrWhiteSpace(cfg.DeeplSplitSentences)) payload["split_sentences"] = cfg.DeeplSplitSentences.Trim();
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(Math.Max(1000, cfg.TimeoutMs)) };
+        using var req = new HttpRequestMessage(HttpMethod.Post, cfg.Endpoint);
+        req.Headers.Authorization = new AuthenticationHeaderValue("DeepL-Auth-Key", apiKey);
+        req.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+
+        using var resp = await http.SendAsync(req).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"DeepL HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.GetProperty("translations")[0].GetProperty("text").GetString() ?? "";
+    }
+
+    private static async Task<string> TranslateWithLibreAsync(string text, TranslationConfig cfg)
+    {
+        var target = NormalizeLibreLang(PickTargetLanguage(text, cfg.TargetLang, cfg.AlternateTargetLangWhenInputLooksChinese));
+        var source = string.IsNullOrWhiteSpace(cfg.SourceLang) ? "auto" : NormalizeLibreLang(cfg.SourceLang);
+        var payload = new Dictionary<string, object?>
+        {
+            ["q"] = text,
+            ["source"] = source,
+            ["target"] = target,
+            ["format"] = "text"
+        };
+        if (!string.IsNullOrWhiteSpace(cfg.LibreTranslateApiKey)) payload["api_key"] = cfg.LibreTranslateApiKey.Trim();
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(Math.Max(1000, cfg.TimeoutMs)) };
+        using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var resp = await http.PostAsync(cfg.LibreTranslateEndpoint, content).ConfigureAwait(false);
+        var body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"LibreTranslate HTTP {(int)resp.StatusCode}: {TrimError(body)}");
+
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.GetProperty("translatedText").GetString() ?? "";
+    }
+
+    private static string GetApiKey(TranslationConfig cfg)
+    {
+        if (!string.IsNullOrWhiteSpace(cfg.ApiKey)) return cfg.ApiKey.Trim();
+        return string.IsNullOrWhiteSpace(cfg.ApiKeyEnv) ? "" : (Environment.GetEnvironmentVariable(cfg.ApiKeyEnv.Trim()) ?? "");
+    }
+
+    private static string PickTargetLanguage(string text, string target, string alternateWhenChinese)
+    {
+        target = string.IsNullOrWhiteSpace(target) ? "ZH-HANS" : target.Trim();
+        if ((target.StartsWith("ZH", StringComparison.OrdinalIgnoreCase) || target.Equals("zh", StringComparison.OrdinalIgnoreCase)) && LooksChinese(text))
+            return string.IsNullOrWhiteSpace(alternateWhenChinese) ? "EN-US" : alternateWhenChinese.Trim();
+        return target;
+    }
+
+    private static string NormalizeLibreLang(string lang)
+    {
+        lang = lang.Trim().ToLowerInvariant();
+        return lang switch
+        {
+            "zh-hans" or "zh-hant" or "zh-cn" or "zh-tw" => "zh",
+            "en-us" or "en-gb" => "en",
+            _ => lang
+        };
+    }
+
+    private static bool LooksChinese(string text)
+    {
+        int cjk = 0, letters = 0;
+        foreach (var ch in text)
+        {
+            if (ch >= '\u4e00' && ch <= '\u9fff') cjk++;
+            if (char.IsLetter(ch)) letters++;
+        }
+        return letters > 0 && cjk >= Math.Max(2, letters / 4);
+    }
+
+    private static string TrimError(string s) => string.IsNullOrWhiteSpace(s) ? "" : s.Length <= 600 ? s : s[..600] + "...";
+}
+
+internal sealed class OverlayForm : Form
+{
+    private const int WS_EX_TOPMOST = 0x00000008;
+    private const int WS_EX_TOOLWINDOW = 0x00000080;
+    private const int WS_EX_NOACTIVATE = 0x08000000;
+
+    private readonly string _text;
+    private readonly OverlayConfig _cfg;
+
+    protected override bool ShowWithoutActivation => true;
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            return cp;
+        }
+    }
+
+    public OverlayForm(string text, OverlayConfig cfg)
+    {
+        _text = text;
+        _cfg = cfg;
+        ConfigureWindow();
+        BuildContent();
+    }
+
+    private void ConfigureWindow()
+    {
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        ShowInTaskbar = false;
+        TopMost = true;
+        Opacity = Math.Clamp(_cfg.Opacity, 0.55, 1.0);
+        BackColor = Color.FromArgb(250, 250, 250);
+        Padding = new Padding(_cfg.PaddingPx);
+    }
+
+    private void BuildContent()
+    {
+        var font = new Font(_cfg.FontName, _cfg.FontSize, FontStyle.Regular, GraphicsUnit.Point);
+        int closeSize = 24;
+        int textMaxWidth = Math.Max(_cfg.MinWidthPx, _cfg.MaxWidthPx - _cfg.PaddingPx * 2);
+
+        var measured = TextRenderer.MeasureText(
+            _text,
+            font,
+            new Size(textMaxWidth, int.MaxValue),
+            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
+
+        int contentWidth = Math.Clamp(measured.Width + 10, _cfg.MinWidthPx, _cfg.MaxWidthPx);
+        int contentHeight = Math.Min(measured.Height + 8, _cfg.MaxHeightPx - closeSize - _cfg.PaddingPx * 2);
+        int formWidth = contentWidth + _cfg.PaddingPx * 2;
+        int formHeight = contentHeight + closeSize + _cfg.PaddingPx * 2;
+        Size = new Size(formWidth, formHeight);
+
+        var close = new Label
+        {
+            Text = "×",
+            Font = new Font(_cfg.FontName, 12f, FontStyle.Bold, GraphicsUnit.Point),
+            TextAlign = ContentAlignment.MiddleCenter,
+            Cursor = Cursors.Hand,
+            BackColor = Color.Transparent,
+            Bounds = new Rectangle(formWidth - _cfg.PaddingPx - closeSize, _cfg.PaddingPx - 4, closeSize, closeSize)
+        };
+        close.Click += (_, _) => Close();
+        Controls.Add(close);
+
+        var panel = new Panel
+        {
+            AutoScroll = measured.Height + 8 > contentHeight,
+            Bounds = new Rectangle(_cfg.PaddingPx, _cfg.PaddingPx + closeSize, contentWidth, contentHeight),
+            BackColor = Color.Transparent
+        };
+
+        var label = new Label
+        {
+            Text = _text,
+            Font = font,
+            AutoSize = true,
+            MaximumSize = new Size(contentWidth - 6, 0),
+            BackColor = Color.Transparent
+        };
+
+        if (_cfg.CopyOnRightClick)
+        {
+            label.MouseUp += (_, e) => CopyOnRightClick(e);
+            panel.MouseUp += (_, e) => CopyOnRightClick(e);
+        }
+
+        panel.Controls.Add(label);
+        Controls.Add(panel);
+        PositionNearCursor();
+    }
+
+    private void CopyOnRightClick(MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Right) return;
+        try { Clipboard.SetText(_text); } catch { }
+        Close();
+    }
+
+    private void PositionNearCursor()
+    {
+        NativeMethods.GetCursorPos(out var p);
+        var screen = Screen.FromPoint(new Point(p.X, p.Y)).WorkingArea;
+
+        int x = p.X + _cfg.OffsetX;
+        int y = p.Y + _cfg.OffsetY;
+
+        if (x + Width > screen.Right) x = p.X - Width - _cfg.OffsetX;
+        if (y + Height > screen.Bottom) y = p.Y - Height - _cfg.OffsetY;
+        if (x < screen.Left) x = screen.Left;
+        if (y < screen.Top) y = screen.Top;
+
+        Location = new Point(x, y);
+    }
+}
+
+internal static class NativeMethods
+{
+    private const uint INPUT_KEYBOARD = 1;
+    private const ushort VK_CONTROL = 0x11;
+    private const ushort VK_C = 0x43;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+
+    [DllImport("user32.dll")]
+    public static extern uint GetClipboardSequenceNumber();
+
+    [DllImport("user32.dll")]
+    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out POINT lpPoint);
+
+    public static void SendCtrlC()
+    {
+        var inputs = new[]
+        {
+            KeyDown(VK_CONTROL),
+            KeyDown(VK_C),
+            KeyUp(VK_C),
+            KeyUp(VK_CONTROL)
+        };
+        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
+    }
+
+    private static INPUT KeyDown(ushort vk) => new()
+    {
+        Type = INPUT_KEYBOARD,
+        U = new InputUnion { Ki = new KEYBDINPUT { WVk = vk } }
+    };
+
+    private static INPUT KeyUp(ushort vk) => new()
+    {
+        Type = INPUT_KEYBOARD,
+        U = new InputUnion { Ki = new KEYBDINPUT { WVk = vk, DwFlags = KEYEVENTF_KEYUP } }
+    };
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct INPUT
+    {
+        public uint Type;
+        public InputUnion U;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct InputUnion
+    {
+        [FieldOffset(0)] public KEYBDINPUT Ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KEYBDINPUT
+    {
+        public ushort WVk;
+        public ushort WScan;
+        public uint DwFlags;
+        public uint Time;
+        public IntPtr DwExtraInfo;
+    }
+}

@@ -30,7 +30,7 @@ internal static class Program
 
             if (cli.ShowVersion)
             {
-                Console.WriteLine("ClipTranslateOnce 0.5.1");
+                Console.WriteLine("ClipTranslateOnce 0.5.2");
                 return 0;
             }
 
@@ -1248,8 +1248,9 @@ internal sealed class OverlayTextView : Control
     private const TextFormatFlags DrawFlags =
         TextFormatFlags.WordBreak |
         TextFormatFlags.TextBoxControl |
-        TextFormatFlags.NoPrefix |
-        TextFormatFlags.NoClipping;
+        TextFormatFlags.NoPrefix;
+
+    public int SafetyPadding { get; set; } = 12;
 
     public OverlayTextView()
     {
@@ -1263,7 +1264,11 @@ internal sealed class OverlayTextView : Control
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        var rect = new Rectangle(0, 0, Math.Max(1, Width), Math.Max(1, Height));
+        // Keep an internal right/bottom gutter. Some fonts and mixed CJK/Latin text
+        // paint a few pixels beyond the measured logical rectangle. If the text is
+        // drawn all the way to the control edge, WinForms clips the last glyph.
+        int safe = Math.Clamp(SafetyPadding, 4, 48);
+        var rect = new Rectangle(0, 0, Math.Max(1, Width - safe), Math.Max(1, Height - safe));
         TextRenderer.DrawText(e.Graphics, Text ?? string.Empty, Font, rect, ForeColor, DrawFlags);
     }
 }
@@ -1317,6 +1322,7 @@ internal sealed class OverlayForm : Form
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
         TopMost = true;
+        AutoScaleMode = AutoScaleMode.None;
         DoubleBuffered = true;
         Opacity = Math.Clamp(_cfg.Opacity, 0.30, 1.0);
         BackColor = ParseColor(_cfg.BackgroundColor, Color.FromArgb(250, 250, 250));
@@ -1329,25 +1335,29 @@ internal sealed class OverlayForm : Form
         var previousLocation = Location;
         Controls.Clear();
 
+        SuspendLayout();
+
         var padding = Math.Clamp(_cfg.PaddingPx, 2, 48);
         var closeSize = Math.Clamp(_cfg.CloseButtonSizePx, 12, 32);
-        var maxWidth = Math.Max(_cfg.MinWidthPx, _cfg.MaxWidthPx);
-        var maxHeight = Math.Max(80, _cfg.MaxHeightPx);
-        var minWidth = Math.Clamp(_cfg.MinWidthPx, 80, maxWidth);
         var fontSize = Math.Clamp(_cfg.FontSize, 7f, 36f);
+        int safety = Math.Clamp(_cfg.TextSafetyPaddingPx, 4, 48);
+
+        var cursorPoint = Cursor.Position;
+        var workArea = Screen.FromPoint(cursorPoint).WorkingArea;
+        var maxWidth = Math.Min(Math.Max(_cfg.MinWidthPx, _cfg.MaxWidthPx), Math.Max(160, workArea.Width - 12));
+        var maxHeight = Math.Min(Math.Max(80, _cfg.MaxHeightPx), Math.Max(90, workArea.Height - 12));
+        var minWidth = Math.Clamp(_cfg.MinWidthPx, 80, maxWidth);
 
         using var measureFont = new Font(_cfg.FontName, fontSize, FontStyle.Regular, GraphicsUnit.Point);
         int textMaxWidth = Math.Max(80, maxWidth - padding * 2);
         int textMaxHeight = Math.Max(60, maxHeight - padding * 2);
         int minContentWidth = Math.Max(40, minWidth - padding * 2);
-        int safety = Math.Clamp(_cfg.TextSafetyPaddingPx, 4, 32);
 
-        const TextFormatFlags measureFlags = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix;
+        const TextFormatFlags measureFlags = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix | TextFormatFlags.LeftAndRightPadding;
 
-        // Do not use Label.AutoSize here. With mixed CJK/Latin text, WinForms Label and
-        // TextRenderer.MeasureText can disagree by a few pixels, which clips the last
-        // glyph even though the stored text is complete. Use a fixed-size owner-drawn
-        // text control and add an explicit safety margin for right/bottom glyph overhang.
+        // The drawing rectangle intentionally keeps a safety gutter on the right/bottom.
+        // Therefore measurement also uses a width that is smaller than the visible text
+        // control. This prevents the last glyph from being painted at the window edge.
         var measuredAtMax = TextRenderer.MeasureText(
             _text,
             measureFont,
@@ -1372,19 +1382,22 @@ internal sealed class OverlayForm : Form
 
         int formWidth = Math.Clamp(contentWidth + padding * 2, minWidth, maxWidth);
         int formHeight = Math.Clamp(contentHeight + padding * 2, 42, maxHeight);
-        Size = new Size(formWidth, formHeight);
+        ClientSize = new Size(formWidth, formHeight);
+
+        int clientW = ClientSize.Width;
+        int clientH = ClientSize.Height;
 
         var panel = new Panel
         {
             AutoScroll = needScroll,
-            Bounds = new Rectangle(padding, padding, formWidth - padding * 2, formHeight - padding * 2),
+            Bounds = new Rectangle(padding, padding, Math.Max(40, clientW - padding * 2), Math.Max(24, clientH - padding * 2)),
             BackColor = Color.Transparent,
             Cursor = Cursors.SizeAll
         };
         panel.MouseDown += BeginDrag;
 
         int scrollReserve = needScroll ? SystemInformation.VerticalScrollBarWidth : 0;
-        int textControlWidth = Math.Max(40, panel.Width - scrollReserve - 1);
+        int textControlWidth = Math.Max(40, panel.Width - scrollReserve);
 
         var textView = new OverlayTextView
         {
@@ -1393,7 +1406,8 @@ internal sealed class OverlayForm : Form
             ForeColor = ParseColor(_cfg.TextColor, Color.FromArgb(17, 17, 17)),
             BackColor = Color.Transparent,
             Cursor = Cursors.SizeAll,
-            Bounds = new Rectangle(0, 0, textControlWidth, Math.Max(panel.Height, fullTextHeight))
+            SafetyPadding = safety,
+            Bounds = new Rectangle(0, 0, textControlWidth, Math.Max(panel.Height, fullTextHeight + safety))
         };
         textView.MouseDown += BeginDrag;
 
@@ -1414,7 +1428,7 @@ internal sealed class OverlayForm : Form
             TextAlign = ContentAlignment.MiddleCenter,
             Cursor = Cursors.Hand,
             BackColor = Color.Transparent,
-            Bounds = new Rectangle(formWidth - closeSize - 2, 1, closeSize, closeSize)
+            Bounds = new Rectangle(Math.Max(0, clientW - closeSize - Math.Max(2, padding / 2)), Math.Max(0, padding / 2), closeSize, closeSize)
         };
         close.Click += (_, _) => Close();
         Controls.Add(close);
@@ -1422,6 +1436,8 @@ internal sealed class OverlayForm : Form
 
         MouseDown -= BeginDrag;
         MouseDown += BeginDrag;
+
+        ResumeLayout(false);
 
         if (positionNearCursor || !_positioned)
         {

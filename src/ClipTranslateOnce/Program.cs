@@ -30,7 +30,7 @@ internal static class Program
 
             if (cli.ShowVersion)
             {
-                Console.WriteLine("ClipTranslateOnce 0.5.2");
+                Console.WriteLine("ClipTranslateOnce 0.5.3");
                 return 0;
             }
 
@@ -1282,6 +1282,11 @@ internal sealed class OverlayForm : Form
     private string _text;
     private readonly OverlayConfig _cfg;
     private bool _positioned;
+    private bool _dragging;
+    private Point _dragCursorStart;
+    private Point _dragWindowStart;
+    private Control? _dragCaptureControl;
+    private string? _pendingTextAfterDrag;
 
     protected override bool ShowWithoutActivation => true;
 
@@ -1309,6 +1314,17 @@ internal sealed class OverlayForm : Form
         if (InvokeRequired)
         {
             try { BeginInvoke(new Action(() => SetText(text))); } catch { }
+            return;
+        }
+
+        if (_dragging)
+        {
+            // Do not rebuild controls or resize the window while Windows is still
+            // delivering drag mouse messages. Rebuilding during a drag was the
+            // source of a stale client-size rectangle: the translated text was
+            // present, but the visible window remained clipped to the small
+            // "loading" overlay size.
+            _pendingTextAfterDrag = text;
             return;
         }
 
@@ -1394,7 +1410,7 @@ internal sealed class OverlayForm : Form
             BackColor = Color.Transparent,
             Cursor = Cursors.SizeAll
         };
-        panel.MouseDown += BeginDrag;
+        AttachDragHandlers(panel);
 
         int scrollReserve = needScroll ? SystemInformation.VerticalScrollBarWidth : 0;
         int textControlWidth = Math.Max(40, panel.Width - scrollReserve);
@@ -1409,7 +1425,7 @@ internal sealed class OverlayForm : Form
             SafetyPadding = safety,
             Bounds = new Rectangle(0, 0, textControlWidth, Math.Max(panel.Height, fullTextHeight + safety))
         };
-        textView.MouseDown += BeginDrag;
+        AttachDragHandlers(textView);
 
         if (_cfg.CopyOnRightClick)
         {
@@ -1434,8 +1450,7 @@ internal sealed class OverlayForm : Form
         Controls.Add(close);
         close.BringToFront();
 
-        MouseDown -= BeginDrag;
-        MouseDown += BeginDrag;
+        AttachDragHandlers(this);
 
         ResumeLayout(false);
 
@@ -1451,11 +1466,80 @@ internal sealed class OverlayForm : Form
         }
     }
 
+    private void AttachDragHandlers(Control control)
+    {
+        control.MouseDown -= BeginDrag;
+        control.MouseMove -= DragMove;
+        control.MouseUp -= EndDrag;
+        control.MouseDown += BeginDrag;
+        control.MouseMove += DragMove;
+        control.MouseUp += EndDrag;
+    }
+
     private void BeginDrag(object? sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
-        NativeMethods.ReleaseCapture();
-        NativeMethods.SendMessage(Handle, NativeMethods.WM_NCLBUTTONDOWN, NativeMethods.HTCAPTION, IntPtr.Zero);
+
+        _dragging = true;
+        _dragCursorStart = Cursor.Position;
+        _dragWindowStart = Location;
+        _dragCaptureControl = sender as Control ?? this;
+        _dragCaptureControl.Capture = true;
+    }
+
+    private void DragMove(object? sender, MouseEventArgs e)
+    {
+        if (!_dragging) return;
+
+        if ((Control.MouseButtons & MouseButtons.Left) == 0)
+        {
+            EndDrag(sender, new MouseEventArgs(MouseButtons.Left, 0, e.X, e.Y, e.Delta));
+            return;
+        }
+
+        var current = Cursor.Position;
+        var dx = current.X - _dragCursorStart.X;
+        var dy = current.Y - _dragCursorStart.Y;
+        Location = new Point(_dragWindowStart.X + dx, _dragWindowStart.Y + dy);
+    }
+
+    private void EndDrag(object? sender, MouseEventArgs e)
+    {
+        if (!_dragging || e.Button != MouseButtons.Left) return;
+
+        _dragging = false;
+        if (_dragCaptureControl is not null)
+        {
+            _dragCaptureControl.Capture = false;
+            _dragCaptureControl = null;
+        }
+
+        KeepInsideWorkingArea();
+
+        if (_pendingTextAfterDrag is not null)
+        {
+            var pending = _pendingTextAfterDrag;
+            _pendingTextAfterDrag = null;
+            _text = pending;
+            RebuildContent(positionNearCursor: false);
+        }
+    }
+
+    protected override void OnMouseCaptureChanged(EventArgs e)
+    {
+        base.OnMouseCaptureChanged(e);
+        if (_dragging && (Control.MouseButtons & MouseButtons.Left) == 0)
+        {
+            _dragging = false;
+            _dragCaptureControl = null;
+            if (_pendingTextAfterDrag is not null)
+            {
+                var pending = _pendingTextAfterDrag;
+                _pendingTextAfterDrag = null;
+                _text = pending;
+                RebuildContent(positionNearCursor: false);
+            }
+        }
     }
 
     private void CopyOnRightClick(MouseEventArgs e)

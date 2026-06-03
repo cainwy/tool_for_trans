@@ -30,7 +30,7 @@ internal static class Program
 
             if (cli.ShowVersion)
             {
-                Console.WriteLine("ClipTranslateOnce 0.5.0");
+                Console.WriteLine("ClipTranslateOnce 0.5.1");
                 return 0;
             }
 
@@ -469,6 +469,7 @@ internal sealed record OverlayConfig
     public string FontName { get; set; } = "Microsoft YaHei UI";
     public float FontSize { get; set; } = 12.5f;
     public int CloseButtonSizePx { get; set; } = 18;
+    public int TextSafetyPaddingPx { get; set; } = 12;
     public bool CopyOnRightClick { get; set; } = true;
     public bool CloseOnRightClickCopy { get; set; } = false;
     public string LoadingText { get; set; } = "翻译中...";
@@ -1241,6 +1242,32 @@ internal static class Translator
     private static string TrimError(string s) => string.IsNullOrWhiteSpace(s) ? "" : s.Length <= 600 ? s : s[..600] + "...";
 }
 
+
+internal sealed class OverlayTextView : Control
+{
+    private const TextFormatFlags DrawFlags =
+        TextFormatFlags.WordBreak |
+        TextFormatFlags.TextBoxControl |
+        TextFormatFlags.NoPrefix |
+        TextFormatFlags.NoClipping;
+
+    public OverlayTextView()
+    {
+        SetStyle(ControlStyles.UserPaint |
+                 ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer |
+                 ControlStyles.ResizeRedraw |
+                 ControlStyles.SupportsTransparentBackColor, true);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        var rect = new Rectangle(0, 0, Math.Max(1, Width), Math.Max(1, Height));
+        TextRenderer.DrawText(e.Graphics, Text ?? string.Empty, Font, rect, ForeColor, DrawFlags);
+    }
+}
+
 internal sealed class OverlayForm : Form
 {
     private const int WS_EX_TOPMOST = 0x00000008;
@@ -1312,48 +1339,71 @@ internal sealed class OverlayForm : Form
         using var measureFont = new Font(_cfg.FontName, fontSize, FontStyle.Regular, GraphicsUnit.Point);
         int textMaxWidth = Math.Max(80, maxWidth - padding * 2);
         int textMaxHeight = Math.Max(60, maxHeight - padding * 2);
+        int minContentWidth = Math.Max(40, minWidth - padding * 2);
+        int safety = Math.Clamp(_cfg.TextSafetyPaddingPx, 4, 32);
 
-        var measured = TextRenderer.MeasureText(
+        const TextFormatFlags measureFlags = TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl | TextFormatFlags.NoPrefix;
+
+        // Do not use Label.AutoSize here. With mixed CJK/Latin text, WinForms Label and
+        // TextRenderer.MeasureText can disagree by a few pixels, which clips the last
+        // glyph even though the stored text is complete. Use a fixed-size owner-drawn
+        // text control and add an explicit safety margin for right/bottom glyph overhang.
+        var measuredAtMax = TextRenderer.MeasureText(
             _text,
             measureFont,
-            new Size(textMaxWidth, int.MaxValue),
-            TextFormatFlags.WordBreak | TextFormatFlags.NoPadding | TextFormatFlags.TextBoxControl);
+            new Size(Math.Max(40, textMaxWidth - safety), int.MaxValue),
+            measureFlags);
 
-        int contentWidth = Math.Clamp(measured.Width + 4, minWidth - padding * 2, textMaxWidth);
-        int contentHeight = Math.Min(measured.Height + 4, textMaxHeight);
+        int contentWidth = Math.Clamp(measuredAtMax.Width + safety, minContentWidth, textMaxWidth);
+        var measuredFinal = TextRenderer.MeasureText(
+            _text,
+            measureFont,
+            new Size(Math.Max(40, contentWidth - safety), int.MaxValue),
+            measureFlags);
+
+        int fullTextHeight = Math.Max(24, measuredFinal.Height + safety);
+        int contentHeight = Math.Min(fullTextHeight, textMaxHeight);
+        bool needScroll = fullTextHeight > contentHeight;
+
+        if (needScroll && contentWidth + SystemInformation.VerticalScrollBarWidth <= textMaxWidth)
+        {
+            contentWidth += SystemInformation.VerticalScrollBarWidth;
+        }
+
         int formWidth = Math.Clamp(contentWidth + padding * 2, minWidth, maxWidth);
         int formHeight = Math.Clamp(contentHeight + padding * 2, 42, maxHeight);
         Size = new Size(formWidth, formHeight);
 
         var panel = new Panel
         {
-            AutoScroll = measured.Height + 4 > contentHeight,
+            AutoScroll = needScroll,
             Bounds = new Rectangle(padding, padding, formWidth - padding * 2, formHeight - padding * 2),
             BackColor = Color.Transparent,
             Cursor = Cursors.SizeAll
         };
         panel.MouseDown += BeginDrag;
 
-        var label = new Label
+        int scrollReserve = needScroll ? SystemInformation.VerticalScrollBarWidth : 0;
+        int textControlWidth = Math.Max(40, panel.Width - scrollReserve - 1);
+
+        var textView = new OverlayTextView
         {
             Text = _text,
             Font = new Font(_cfg.FontName, fontSize, FontStyle.Regular, GraphicsUnit.Point),
             ForeColor = ParseColor(_cfg.TextColor, Color.FromArgb(17, 17, 17)),
-            AutoSize = true,
-            MaximumSize = new Size(Math.Max(40, panel.Width - 4), 0),
             BackColor = Color.Transparent,
             Cursor = Cursors.SizeAll,
-            UseCompatibleTextRendering = false
+            Bounds = new Rectangle(0, 0, textControlWidth, Math.Max(panel.Height, fullTextHeight))
         };
-        label.MouseDown += BeginDrag;
+        textView.MouseDown += BeginDrag;
 
         if (_cfg.CopyOnRightClick)
         {
-            label.MouseUp += (_, e) => CopyOnRightClick(e);
+            textView.MouseUp += (_, e) => CopyOnRightClick(e);
             panel.MouseUp += (_, e) => CopyOnRightClick(e);
         }
 
-        panel.Controls.Add(label);
+        panel.Controls.Add(textView);
         Controls.Add(panel);
 
         var close = new Label
